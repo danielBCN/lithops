@@ -31,7 +31,6 @@ from threading import Thread
 from multiprocessing import Process, Pipe
 from tblib import pickling_support
 from types import SimpleNamespace
-from multiprocessing.managers import SyncManager
 
 from lithops.version import __version__
 from lithops.config import extract_storage_config
@@ -82,9 +81,7 @@ def function_handler(payload):
         work_queue.put(ShutdownSentinel())
         python_queue_consumer(0, work_queue, )
     else:
-        manager = SyncManager()
-        manager.start()
-        work_queue = manager.Queue()
+        work_queue = Queue()
         job_runners = []
 
         for call_id in job.call_ids:
@@ -93,14 +90,12 @@ def function_handler(payload):
 
         for pid in range(worker_processes):
             work_queue.put(ShutdownSentinel())
-            p = mp.Process(target=python_queue_consumer, args=(pid, work_queue,))
-            job_runners.append(p)
-            p.start()
+            t = Thread(target=python_queue_consumer, args=(pid, work_queue,))
+            job_runners.append(t)
+            t.start()
 
         for runner in job_runners:
             runner.join()
-
-        manager.shutdown()
 
     # Delete modules path from syspath
     module_path = os.path.join(MODULES_DIR, job.job_key)
@@ -114,7 +109,7 @@ def python_queue_consumer(pid, work_queue, initializer=None, callback=None):
     """
     Listens to the job_queue and executes the individual job tasks
     """
-    logger.info(f'Worker process {pid} started')
+    logger.info(f'Worker thread {pid} started')
     while True:
         try:
             event = work_queue.get(block=True)
@@ -136,7 +131,7 @@ def python_queue_consumer(pid, work_queue, initializer=None, callback=None):
 
         callback(pid, task) if callback is not None else None
 
-    logger.info(f'Worker process {pid} finished')
+    logger.info(f'Worker thread {pid} finished')
 
 
 def prepare_and_run_task(task):
