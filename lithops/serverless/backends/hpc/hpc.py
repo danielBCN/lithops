@@ -130,12 +130,40 @@ class HpcBackend:
         )
         if "gpus_worker" in runtime_config:
             # slurm_cmd.add_arguments(gpus_per_task=runtime_config["gpus_worker"])
-            slurm_cmd.add_arguments(gres=f"gpu:{runtime_config["gpus_worker"]}")
+            slurm_cmd.add_arguments(gres=f"gpu:{runtime_config['gpus_worker']}")
         if "extra_slurm_args" in runtime_config:
             slurm_cmd.add_arguments(**runtime_config["extra_slurm_args"])
         slurm_cmd.add_cmd("export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}")
+
+        # GEKKOFS
+        gekko_sh = os.path.join(os.path.dirname(__file__), "gkfs_start.sh")
+        slurm_cmd.add_cmd('export GKFS_BASE="/gpfs/${HOME}/gekkofs_base"')
+        slurm_cmd.add_cmd('export GEKKODEPS="${GKFS_BASE}/iodeps"')
+        slurm_cmd.add_cmd('export GKFS="${GEKKODEPS}/lib64/libgkfs_intercept.so"')
+        slurm_cmd.add_cmd('export LIBGKFS_HOSTS_FILE="${HOME}/test/gkfs_hosts.txt"')
+        slurm_cmd.add_cmd('echo "Removing ${LIBGKFS_HOSTS_FILE}"')
+        slurm_cmd.add_cmd('rm "${LIBGKFS_HOSTS_FILE}"')
+        slurm_cmd.add_cmd(
+            "srun -c 1 -n ${SLURM_NNODES} -N ${SLURM_NNODES}",
+            "--ntasks-per-node=1 --mem=0 --oversubscribe --export='ALL'",
+            "/bin/bash",
+            gekko_sh,
+            "&",
+        )
+        slurm_cmd.add_cmd('while [[ ! -f "${LIBGKFS_HOSTS_FILE}" ]]; do sleep 1; done')
+        slurm_cmd.add_cmd('while [[ $(wc -l < "$LIBGKFS_HOSTS_FILE") -lt ${SLURM_NNODES} ]]; do sleep 1; done')
+        slurm_cmd.add_cmd('export LD_PRELOAD="${GKFS}"')
+
         slurm_job = slurm_cmd.sbatch(
-            "srun", "-l", "python", entry_point, rabbit_url, runtime_task_queue, runtime_config["max_tasks_worker"]
+            "srun",
+            "-l",
+            "--mem=0",
+            "--oversubscribe",
+            "python",
+            entry_point,
+            rabbit_url,
+            runtime_task_queue,
+            runtime_config["max_tasks_worker"],
         )
         if logger.level == logging.DEBUG:
             logger.debug(f"sbatch script:\n{slurm_cmd.script()}")
