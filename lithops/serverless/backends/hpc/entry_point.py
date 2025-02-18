@@ -25,6 +25,7 @@ from threading import Thread
 import pika
 import pika.adapters.blocking_connection
 import pika.channel
+import pika.spec
 
 from lithops.serverless.backends.hpc.hpc import RETURN_QUEUE_POSTFIX
 from lithops.utils import b64str_to_dict, dict_to_b64str, setup_lithops_logger
@@ -41,7 +42,7 @@ def extract_runtime_meta(ch: pika.channel.Channel):
     runtime_meta = get_runtime_metadata()
     ch.basic_publish(
         exchange="",
-        routing_key=rmq_task_queue + RETURN_QUEUE_POSTFIX,
+        routing_key=rmq_mng_queue + RETURN_QUEUE_POSTFIX,
         body=json.dumps(runtime_meta),
         properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
     )
@@ -126,17 +127,22 @@ def actions_switcher(ch, method, properties, body):
         manage_work_queue(ch, method, payload)
     elif action == "stop":
         ch.basic_ack(delivery_tag=method.delivery_tag)
-        ch.basic_cancel(method.consumer_tag)
+        ch.basic_cancel(rt_consumer_tag)
+        ch.basic_cancel(tk_consumer_tag)
 
 
 if __name__ == "__main__":
     # Parse args
     rabbit_url = sys.argv[1]
-    rmq_task_queue = sys.argv[2]
-    task_concurrency = int(sys.argv[3])
+    rmq_mng_queue = sys.argv[2]
+    rmq_task_queue = sys.argv[3]
+    task_concurrency = int(sys.argv[4])
     setup_lithops_logger("INFO")
 
-    logger.info(f"Starting HPC Lithops worker node... max_tasks={task_concurrency}")
+    python_version = sys.version_info
+    python_version = str(python_version[0]) + "." + str(python_version[1])
+    logger.info(f"Lithops v{__version__} - Python version: {python_version}")
+    logger.info(f"Starting HPC Lithops worker node...  max_tasks={task_concurrency}")
     # Shared variable to track running jobs / max concurrent tasks
     running_jobs = Value("i", task_concurrency)
 
@@ -144,12 +150,14 @@ if __name__ == "__main__":
     params = pika.URLParameters(rabbit_url)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
+    channel.queue_declare(queue=rmq_mng_queue, durable=True)
     channel.queue_declare(queue=rmq_task_queue, durable=True)
     channel.basic_qos(prefetch_count=1)
 
     # Start listening for tasks/jobs
-    channel.basic_consume(queue=rmq_task_queue, on_message_callback=actions_switcher)
+    rt_consumer_tag = channel.basic_consume(queue=rmq_mng_queue, on_message_callback=actions_switcher)
+    tk_consumer_tag = channel.basic_consume(queue=rmq_task_queue, on_message_callback=actions_switcher)
 
-    logger.info(f"Listening to RabbitMQ... queue={rmq_task_queue}")
+    logger.info(f"Listening to RabbitMQ... task queue={rmq_task_queue}")
     channel.start_consuming()
     connection.close()
