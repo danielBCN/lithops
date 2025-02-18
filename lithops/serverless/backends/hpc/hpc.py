@@ -206,13 +206,12 @@ class HpcBackend:
             "--oversubscribe",
             "--overlap",
             "--overcommit",
-            "'LD_PRELOAD=${GKFS}",
+            '--export="ALL",LD_PRELOAD=${GKFS}',
             "python",
             entry_point,
             rabbit_url,
             runtime_task_queue,
             runtime_config["max_tasks_worker"],
-            "'",
         )
         if logger.level == logging.DEBUG:
             logger.debug(f"sbatch script:\n{slurm_cmd.script()}")
