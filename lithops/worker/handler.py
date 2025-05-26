@@ -202,7 +202,7 @@ def run_task(task):
         handler_conn, jobrunner_conn = Pipe()
         jobrunner = JobRunner(task, jobrunner_conn, internal_storage)
         logger.debug('Starting JobRunner process')
-        jrp = Process(target=jobrunner.run) if is_unix_system() else Thread(target=jobrunner.run)
+        jrp = Thread(target=jobrunner.run)
 
         process_id = os.getpid() if is_unix_system() else mp.current_process().pid
         sys_monitor = SystemMonitor(process_id)
