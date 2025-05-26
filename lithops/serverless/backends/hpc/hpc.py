@@ -30,6 +30,7 @@ from lithops.version import __version__
 
 from .slurm import Slurm
 from .slurm import SlurmPattern as SP
+from .gekkofs import start_script
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,6 @@ class HpcBackend:
         self.__params = pika.URLParameters(self.amqp_url)
         self.__connection = None
         self.__channel = None
-        self.__connect_rmq()
 
         msg = COMPUTE_CLI_MSG.format("HPC")
         logger.info(f"{msg}")
@@ -69,37 +69,35 @@ class HpcBackend:
         if hasattr(self, "connection"):
             self.__connection.close()
 
-    def __connect_rmq(self):
+    def __get_rmq_channel(self):
+        if self.__connection:
+            try:
+                self.__connection.process_data_events()
+            except pika.exceptions.AMQPConnectionError:
+                logger.debug("RabbitMQ connection closed")
+                self.__connection = None
+                self.__channel = None
         if not self.__connection or self.__connection.is_closed:
+            logger.debug("Connecting to RabbitMQ")
             self.__connection = pika.BlockingConnection(self.__params)
             self.__channel = self.__connection.channel()
+        return self.__channel
 
     def __declare_rmq_queues(self, *queues):
         for queue in queues:
-            try:
-                self.__channel.queue_declare(queue=queue, durable=True)
-            except pika.exceptions.ConnectionClosed:
-                logger.warning("Connection to RabbitMQ closed. Reconnecting...")
-                self.__connect_rmq()
-                self.__channel.queue_declare(queue=queue, durable=True)
+            self.__get_rmq_channel().queue_declare(queue=queue, durable=True)
+
+    def __delete_rmq_queues(self, *queues):
+        for queue in queues:
+            self.__get_rmq_channel().queue_delete(queue=queue)
 
     def __publish_to_rabbit(self, queue, message):
-        try:
-            self.__channel.basic_publish(
-                exchange="",
-                routing_key=queue,
-                body=json.dumps(message),
-                properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
-            )
-        except pika.exceptions.ConnectionClosed:
-            logger.warning("Connection to RabbitMQ closed. Reconnecting...")
-            self.__connect_rmq()
-            self.__channel.basic_publish(
-                exchange="",
-                routing_key=queue,
-                body=json.dumps(message),
-                properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
-            )
+        self.__get_rmq_channel().basic_publish(
+            exchange="",
+            routing_key=queue,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
 
     def _format_runtime_name(self, runtime_name, version=__version__):
         name = f"{runtime_name}-{version}"
@@ -168,6 +166,8 @@ class HpcBackend:
             ntasks=runtime_config["num_workers"],
             cpus_per_task=runtime_config["cpus_worker"],
             # nodes=runtime_config["num_nodes"],
+            time=runtime_config["max_time"],
+            signal="SIGUSR1@20"
         )
         if "gpus_worker" in runtime_config:
             # slurm_cmd.add_arguments(gpus_per_task=runtime_config["gpus_worker"])
@@ -178,42 +178,58 @@ class HpcBackend:
 
         entry_point = os.path.join(os.path.dirname(__file__), "entry_point.py")
 
-        # GEKKOFS
-        gekko_sh = os.path.join(os.path.dirname(__file__), "gkfs_start.sh")
-        slurm_cmd.add_cmd('export GKFS_BASE="/gpfs/${HOME}/gekkofs_base"')
-        slurm_cmd.add_cmd('export GEKKODEPS="${GKFS_BASE}/iodeps"')
-        slurm_cmd.add_cmd('export GKFS_LOG_LEVEL=0')
-        slurm_cmd.add_cmd('export LIBGKFS_LOG=none')
-        slurm_cmd.add_cmd('export GKFS="${GEKKODEPS}/lib64/libgkfs_intercept.so"')
-        slurm_cmd.add_cmd('export LIBGKFS_HOSTS_FILE="${HOME}/test/gkfs_hosts.txt"')
-        slurm_cmd.add_cmd('echo "Removing ${LIBGKFS_HOSTS_FILE}"')
-        slurm_cmd.add_cmd('rm "${LIBGKFS_HOSTS_FILE}"')
-        slurm_cmd.add_cmd(
-            "srun -c ${SLURM_CPUS_ON_NODE}",
-            "-n ${SLURM_NNODES} -N ${SLURM_NNODES}",
-            "--mem=0 --overlap --export=ALL",
-            "/bin/bash",
-            gekko_sh,
-            "&",
-        )
-        slurm_cmd.add_cmd('while [[ ! -f "${LIBGKFS_HOSTS_FILE}" ]]; do sleep 1; done')
-        slurm_cmd.add_cmd('while [[ $(wc -l < "$LIBGKFS_HOSTS_FILE") -lt ${SLURM_NNODES} ]]; do sleep 1; done')
+        command = ["srun", "-l"]
 
-        slurm_job = slurm_cmd.sbatch(
-            "srun",
-            "-l",
-            "--mem=0",
-            '--export=ALL,LD_PRELOAD=${GKFS}',
-            "python",
-            entry_point,
-            rabbit_url,
-            runtime_task_queue,
-            runtime_config["max_tasks_worker"],
+        # GEKKOFS
+        if "mode" in runtime_config and "gkfs" in runtime_config["mode"]:
+            logger.info("Running HPC runtime with GKFS")
+            gekko_sh = os.path.join(os.path.dirname(__file__), "gkfs_start.sh")
+            with open(gekko_sh, "w") as f:
+                f.write(start_script)
+            slurm_cmd.add_cmd('export GKFS_BASE="/gpfs/${HOME}/gekkofs_base"')
+            slurm_cmd.add_cmd('export GEKKODEPS="${GKFS_BASE}/iodeps"')
+            slurm_cmd.add_cmd("export GKFS_LOG_LEVEL=0")
+            slurm_cmd.add_cmd("export LIBGKFS_LOG=none")
+            slurm_cmd.add_cmd('export GKFS="${GEKKODEPS}/lib64/libgkfs_intercept.so"')
+            slurm_cmd.add_cmd('export LIBGKFS_HOSTS_FILE="${HOME}/test/gkfs_hosts.txt"')
+            slurm_cmd.add_cmd('echo "Removing ${LIBGKFS_HOSTS_FILE}"')
+            slurm_cmd.add_cmd('rm "${LIBGKFS_HOSTS_FILE}"')
+            slurm_cmd.add_cmd(
+                "srun -c ${SLURM_CPUS_ON_NODE}",
+                "-n ${SLURM_NNODES} -N ${SLURM_NNODES}",
+                "--mem=0 --overlap -overcommit --oversubscribe --export='ALL'",
+                "/bin/bash",
+                gekko_sh,
+                "&",
+            )
+            slurm_cmd.add_cmd('while [[ ! -f "${LIBGKFS_HOSTS_FILE}" ]]; do sleep 1; done')
+            slurm_cmd.add_cmd('while [[ $(wc -l < "$LIBGKFS_HOSTS_FILE") -lt ${SLURM_NNODES} ]]; do sleep 1; done')
+            command.extend(
+                [
+                    "--mem=0",
+                    "--oversubscribe",
+                    "--overlap",
+                    "--overcommit",
+                    '--export="ALL",LD_PRELOAD=${GKFS}',
+                ]
+            )
+
+        command.extend(
+            [
+                "python",
+                entry_point,
+                rabbit_url,
+                runtime_mng_queue,
+                runtime_task_queue,
+                runtime_config["max_tasks_worker"],
+            ]
         )
+        slurm_job = slurm_cmd.sbatch(*command)
         if logger.level == logging.DEBUG:
             logger.debug(f"sbatch script:\n{slurm_cmd.script()}")
-        while not slurm_job.wait(timeout=60):
-            self.__connection.process_data_events()  # Avoid Rabbit to drop connection during long waits
+        slurm_job.wait()
+        # while not slurm_job.wait(timeout=60):
+        #     self.__connection.process_data_events()  # Avoid Rabbit to drop connection during long waits
         time.sleep(10)  # Wait to ensure initializations
         if not slurm_job.is_running():
             raise Exception("Slurm job failed. Check logs.")
@@ -240,7 +256,7 @@ class HpcBackend:
         key = self.get_runtime_key(runtime_name, runtime_memory, version)
         slurm_job_id = self._get_runtime_job_id(key)
         if not slurm_job_id:
-            logger.debug("Runtime is not deployed.")
+            logger.info("Runtime is not deployed.")
             return
 
         slurm_job = Slurm.job_from_id(slurm_job_id)
@@ -274,16 +290,14 @@ class HpcBackend:
         logger.info("Cleaning HPC runtimes")
 
         # Delete all deployed runtimes
-        for runtime in self.list_runtimes():
-            runtime_name = runtime[0]
+        for runtime_name in list(self.hpc_config["runtimes"].keys()):
             runtime_config = self.hpc_config["runtimes"][runtime_name]
-            self.delete_runtime(*runtime)
+            self.delete_runtime(runtime_name, 0, __version__)
             # Delete rabbit queues
-            runtime_task_queue = runtime_config.get("rmq_queue", self._get_rabbit_task_queue(runtime[0]))
+            logger.info(f"Deleting RabbitMQ queues for runtime {runtime_name}")
+            runtime_task_queue = runtime_config.get("rmq_queue", self._get_rabbit_task_queue(runtime_name))
             runtime_mng_queue = self._get_rabbit_management_queue(runtime_name)
-            self.__channel.queue_delete(queue=runtime_mng_queue)
-            self.__channel.queue_delete(queue=runtime_mng_queue + RETURN_QUEUE_POSTFIX)
-            self.__channel.queue_delete(queue=runtime_task_queue)
+            self.__delete_rmq_queues(runtime_task_queue, runtime_mng_queue, runtime_mng_queue + RETURN_QUEUE_POSTFIX)
 
     def list_runtimes(self, runtime_name="all"):
         """
@@ -303,9 +317,7 @@ class HpcBackend:
             runtimes = [(k, 0, __version__) for k in deployed]
             return runtimes
         if runtime_name in deployed:
-            return [
-                (runtime_name, 0, __version__),
-            ]
+            return [(runtime_name, 0, __version__)]
         else:
             return []
 
@@ -402,8 +414,9 @@ class HpcBackend:
             if elapsed_time > 600:  # 10 minutes
                 raise Exception("Unable to extract metadata from the runtime")
 
-            method_frame, properties, body = self.__channel.basic_get(runtime_mng_queue + RETURN_QUEUE_POSTFIX)
-
+            method_frame, properties, body = self.__get_rmq_channel().basic_get(
+                runtime_mng_queue + RETURN_QUEUE_POSTFIX
+            )
             if method_frame:
                 runtime_meta = json.loads(body)
                 break
